@@ -1,10 +1,12 @@
 name: opik
 
 services:
+
   mysql:
-    image: mysql:8.4.2
+    image: mysql:8
     pull_policy: always
     hostname: mysql
+    container_name: opik-mysql
     environment:
       MYSQL_ROOT_PASSWORD: opik
       MYSQL_DATABASE: opik
@@ -12,54 +14,53 @@ services:
       MYSQL_PASSWORD: opik
     healthcheck:
       test: [ "CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "--silent" ]
-      timeout: 1s
-      interval: 1s
-      retries: 300
+    networks:
+      - chatbot
     volumes:
       - mysql:/var/lib/mysql/:type=volume,source=~/opik/mysql
 
-  redis:
-    image: redis:7.2.4-alpine3.19
+  opik-redis:
+    image: redis:alpine
     pull_policy: always
-    hostname: redis
+    hostname: opik-redis
+    container_name: opik-redis
     command: redis-server --requirepass opik
+    networks:
+      - chatbot
     healthcheck:
       test: [ "CMD", "nc", "-z", "localhost", "6379" ]
-      interval: 2s
-      timeout: 4s
-      retries: 20
-      start_period: 30s
 
   clickhouse-init:
     image: alpine:latest
+    networks:
+      - chatbot
     volumes:
       - ./clickhouse_config:/clickhouse_config_files
       - clickhouse-config:/config
     command: |
       sh -c "
-        cp -r /clickhouse_config_files/* /config/ && 
-        chown -R 1000:1000 /config
+        cp -r /clickhouse_config_files/* /config/ && chown -R 1000:1000 /config
       "
+
   clickhouse:
     image: clickhouse/clickhouse-server:24.3.6.48-alpine
     pull_policy: always
     hostname: clickhouse
+    container_name: opik-clickhouse
     environment:
       CLICKHOUSE_DB: opik
       CLICKHOUSE_USER: opik
       CLICKHOUSE_PASSWORD: opik
-      # Enables SQL-driven Access Control and Account Management:
-      # https://clickhouse.com/docs/en/operations/access-rights#enabling-access-control
+      # Enables SQL-driven Access Control and Account Management: https://clickhouse.com/docs/en/operations/access-rights#enabling-access-control
       CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+    networks:
+      - chatbot
     volumes:
       - clickhouse:/var/lib/clickhouse/:type=volume,source=~/opik/clickhouse/data
       - clickhouse-server:/var/log/clickhouse-server/:type=volume,source=~/opik/clickhouse/logs
       - clickhouse-config:/etc/clickhouse-server/config.d
     healthcheck:
       test: [ "CMD", "wget", "--spider", "-q", "http://127.0.0.1:8123/ping" ]
-      interval: 1s
-      timeout: 1s
-      retries: 300
     ulimits:
       nofile:
         soft: 262144
@@ -73,52 +74,44 @@ services:
   zookeeper:
     image: docker.io/bitnami/zookeeper:3.9.3-debian-12-r16
     hostname: zookeeper
+    container_name: opik-zookeeper
     environment:
       ZOO_MY_ID: 1
       ZOO_SERVERS: zookeeper=zookeeper:2888:3888
       ALLOW_ANONYMOUS_LOGIN: "yes"
     healthcheck:
       test: [ "CMD", "/bin/bash", "-ec", "ZOO_HC_TIMEOUT=2", "/opt/bitnami/scripts/zookeeper/healthcheck.sh" ]
-      interval: 1s
-      timeout: 1s
-      retries: 300
+    networks:
+      - chatbot
     volumes:
       - zookeeper:/bitnami/zookeeper
 
   minio:
     image: minio/minio:RELEASE.2025-03-12T18-04-18Z
+    container_name: opik-minio
     environment:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER:-THAAIOSFODNN7EXAMPLE}
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-LESlrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY}
     command: server --console-address ":9090" /data
+    networks:
+      - chatbot
     healthcheck:
       test: [ "CMD", "curl", "-f", "http://localhost:9000/minio/health/live" ]
-      interval: 1s
-      timeout: 10s
-      retries: 30
-      start_period: 5s
 
   mc:
     image: minio/mc:RELEASE.2025-03-12T17-29-24Z
     depends_on:
       - minio
+    networks:
+      - chatbot
     entrypoint: >
-      /bin/sh -c "
-      sleep 10s;
-      /usr/bin/mc alias set s3 http://minio:9000 ${MINIO_ROOT_USER:-THAAIOSFODNN7EXAMPLE} ${MINIO_ROOT_PASSWORD:-LESlrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY} --api S3v4 ;
-      /usr/bin/mc mb --ignore-existing s3/public;
-      /usr/bin/mc anonymous set download s3/public/;       
-      "
+      /bin/sh -c " sleep 10s; /usr/bin/mc alias set s3 http://minio:9000 ${MINIO_ROOT_USER:-THAAIOSFODNN7EXAMPLE} ${MINIO_ROOT_PASSWORD:-LESlrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY} --api S3v4 ; /usr/bin/mc mb --ignore-existing s3/public; /usr/bin/mc anonymous set download s3/public/; "
 
   backend:
     image: ghcr.io/comet-ml/opik/opik-backend:${OPIK_VERSION:-latest}
     pull_policy: always
-    build:
-      context: ../../apps/opik-backend
-      dockerfile: Dockerfile
-      args:
-        OPIK_VERSION: ${OPIK_VERSION:-latest}
     hostname: backend
+    container_name: opik-backend
     command: [ "bash", "-c", "./run_db_migrations.sh && ./entrypoint.sh" ]
     environment:
       # WARNING: Do not set OPIK_VERSION as env var here. It's a multi-stage build, so build and runtime values can differ.
@@ -138,7 +131,7 @@ services:
       ANALYTICS_DB_USERNAME: opik
       ANALYTICS_DB_PASS: opik
       JAVA_OPTS: "-Dliquibase.propertySubstitutionEnabled=true -XX:+UseG1GC -XX:MaxRAMPercentage=80.0"
-      REDIS_URL: redis://:opik@redis:6379/
+      REDIS_URL: redis://:opik@opik-redis:6379/
       OPIK_OTEL_SDK_ENABLED: false
       OTEL_VERSION: 2.16.0
       OTEL_PROPAGATORS: "tracecontext,baggage,b3"
@@ -152,14 +145,12 @@ services:
       PYTHON_EVALUATOR_URL: http://python-backend:8000
       TOGGLE_GUARDRAILS_ENABLED: ${TOGGLE_GUARDRAILS_ENABLED:-"false"}
       TOGGLE_TRACE_THREAD_PYTHON_EVALUATOR_ENABLED: ${TOGGLE_TRACE_THREAD_PYTHON_EVALUATOR_ENABLED:-"true"}
-    ports:
-      - "3003" # OpenAPI specification port
+    networks:
+      - chatbot
+    #ports:
+    #  - "3003" # OpenAPI specification port
     healthcheck:
       test: [ "CMD", "curl", "-f", "http://localhost:8080/health-check" ]
-      interval: 1s
-      timeout: 30s
-      retries: 30
-      start_period: 1s
     depends_on:
       mysql:
         condition: service_healthy
@@ -167,17 +158,17 @@ services:
         condition: service_healthy
       minio:
         condition: service_healthy
-      redis:
+      opik-redis:
         condition: service_healthy
 
   python-backend:
     image: ghcr.io/comet-ml/opik/opik-python-backend:${OPIK_VERSION:-latest}
     pull_policy: always
-    build:
-      context: ../../apps/opik-python-backend
-      dockerfile: Dockerfile
     hostname: python-backend
+    container_name: opik-python-backend
     privileged: true # Required for Docker-in-Docker, so it can launch containers
+    networks:
+      - chatbot
     environment:
       PYTHON_CODE_EXECUTOR_IMAGE_TAG: ${OPIK_VERSION:-latest}
       PYTHON_CODE_EXECUTOR_STRATEGY: ${PYTHON_CODE_EXECUTOR_STRATEGY:-process}
@@ -188,55 +179,17 @@ services:
       OPIK_REVERSE_PROXY_URL: ${OPIK_REVERSE_PROXY_URL:-http://frontend:5173/api}
     healthcheck:
       test: [ "CMD", "sh", "-c", "if [ -f /opt/opik-python-backend/src/opik_backend/healthcheck.py ]; then wget --spider --quiet http://127.0.0.1:8000/healthcheck; else exit 0; fi" ]
-      interval: 2s
-      timeout: 60s
-      retries: 30
       start_period: 2s
-
-  guardrails-backend:
-    image: ghcr.io/comet-ml/opik/opik-guardrails-backend:${OPIK_VERSION:-latest}
-    pull_policy: always
-    profiles:
-      - guardrails
-    build:
-      context: ../../apps/opik-guardrails-backend
-      dockerfile: Dockerfile
-    hostname: guardrails
-    environment:
-      OPIK_VERSION: ${OPIK_VERSION:-latest}
-    healthcheck:
-      test: [ "CMD", "sh", "-c", "wget --spider --quiet http://127.0.0.1:5000/healthcheck" ]
-      interval: 2s
-      timeout: 60s
-      retries: 30
-      start_period: 10s
-
-  demo-data-generator:
-    image: ghcr.io/comet-ml/opik/opik-python-backend:${OPIK_VERSION:-latest}
-    pull_policy: always
-    build:
-      context: ../../apps/opik-python-backend
-      dockerfile: Dockerfile
-    hostname: demo-data-generator
-    environment:
-      CREATE_DEMO_DATA: ${CREATE_DEMO_DATA:-true}
-      PYTHON_BACKEND_URL: ${PYTHON_BACKEND_URL:-http://python-backend:8000}
-    command: [ "sh", "-c", "./demo_data_entrypoint.sh" ]
-    depends_on:
-      frontend:
-        condition: service_healthy
-      python-backend:
-        condition: service_healthy
 
   frontend:
     image: ghcr.io/comet-ml/opik/opik-frontend:${OPIK_VERSION:-latest}
     pull_policy: always
-    build:
-      context: ../../apps/opik-frontend
-      dockerfile: Dockerfile
     hostname: frontend
-    ports:
-      - "5173:5173" # Frontend server port
+    container_name: opik-frontend
+    networks:
+      - chatbot
+    #ports:
+    #  - "5173:5173/tcp" # Frontend server port
     volumes:
       - ./nginx_${OPIK_FRONTEND_FLAVOR:-default}_local.conf:/etc/nginx/conf.d/default.conf
     depends_on:
@@ -244,19 +197,17 @@ services:
         condition: service_healthy
     healthcheck:
       test: [ "CMD", "curl", "-f", "http://localhost:5173" ]
-      interval: 1s
-      timeout: 30s
-      retries: 10
       start_period: 1s
     environment:
       OPIK_VERSION: ${OPIK_VERSION:-latest}
 
 networks:
-  default:
+  chatbot:
+    external: true
 
 volumes:
-  clickhouse:
-  clickhouse-server:
-  clickhouse-config:
-  mysql:
-  zookeeper:
+  clickhouse: {}
+  clickhouse-server: {}
+  clickhouse-config: {}
+  mysql: {}
+  zookeeper: {}
